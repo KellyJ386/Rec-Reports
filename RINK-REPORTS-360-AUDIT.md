@@ -1,0 +1,131 @@
+# Rink Reports — 360° Audit & Roadmap
+
+**Prepared:** 2026-07-01
+**Scope:** Live production system behind `www.rinkreports.com` — Next.js app (Vercel project `rink-reports-5-6`) + Supabase Postgres backend (project `bqbdgwlhbhabsibjgwmk`, Postgres 17.6).
+**Method:** Direct inspection of the live database schema/data (140 tables), Supabase security & performance advisors, and Vercel deployment history (~25 most recent merged PRs). The application source code itself lives in a separate GitHub repo (`KellyJ386/Rink-Reports-5-6`) that this audit session did not have read access to — findings about code-level behavior below are inferred from commit messages, schema comments, and live data, not from reading the source directly. Anything in that category is flagged as such.
+
+---
+
+## 1. Executive Summary
+
+Rink Reports is a multi-tenant, facility-operations platform for ice rinks (daily checklists, incident/accident reporting, refrigeration & air-quality monitoring, ice-depth tracking, employee scheduling, internal communications, role-based permissions). The schema is unusually mature for a pre-launch product: 140 tables, 165 migrations worth of iteration, deliberate immutability/audit-trail patterns (snapshot columns, append-only change logs, 24-hour edit windows), and a genuine multi-tenant permission model (roles → module permissions → per-area permissions).
+
+Engineering velocity is high — the last ~25 merged PRs alone cover a full scheduling-grid rebuild (drag/drop, keyboard accessibility, publish-lock governance), a new Playwright E2E suite, an 8-chapter training/onboarding manual, and two rounds of RLS/RPC security hardening.
+
+The system is currently running with **1 facility, 5 users, 103 employee records** — this reads as an active pilot/onboarding deployment, not yet multi-customer production. Several fully-built modules (Communications, Air Quality, Accident Reports, Employee Invites/Certifications) have **zero rows of real usage**, meaning they're built and deployed but not yet validated by real workflows.
+
+Two security items need attention this week: an anon-writable `information_requests` table with an unconditionally-permissive INSERT policy, and 7 seed/trigger functions still callable directly by unauthenticated `anon` role via PostgREST RPC (a prior PR already fixed some of this pattern, but not all of it).
+
+---
+
+## 2. What's Built (Module Inventory)
+
+| Module | Tables | Real usage (rows) | Read as |
+|---|---|---|---|
+| **Daily Reports** | 6 | 51 templates / 506 checklist items configured, only **2 submissions** | Fully configured, barely exercised |
+| **Incident Reports** | 6 | 1 report | Configured, minimal use |
+| **Accident Reports** | 6 | **0 reports** | Built, unused |
+| **Refrigeration** | 8 | 1 report, 32 captured values | Configured, light use |
+| **Air Quality** | 8 | **0 reports** | Built, unused |
+| **Ice Operations** | 9 | 4 submissions, 0 circle-check results | Configured, light use |
+| **Ice Depth** | 8 | **19 sessions, 377 measurements** | **Most-used module by far** |
+| **Employee Scheduling** | 15 | 7 shifts, 212 job-area assignments, 0 swaps/time-off/availability rows | Config-heavy, live use just starting |
+| **Communications** | 10 | **0 rows across all 10 tables** | Fully built, completely unused |
+| **Permissions/Roles/Employees** | 8 | 5 roles, 103 employees, 140 user_permissions rows | Actively maintained |
+| **Facility Documents, Retention, Export Settings** | 3 | 0 rows | Built, unused |
+
+**Takeaway:** the backend has clearly been engineered ahead of adoption — most modules are production-ready schema-wise but have never processed a real report. Ice Depth is the only module with genuine day-to-day usage patterns. This is a normal shape for a pre-launch pilot, but it means the untested modules (Communications, Air Quality, Accident Reports) carry more unknown risk than the audit's clean schema suggests — they haven't been exercised by real data yet.
+
+---
+
+## 3. Recent Engineering Activity (last ~25 merged PRs)
+
+Reconstructed from Vercel deployment metadata (commit messages), most recent first:
+
+- **PR #240** (open/in-review) — Closed a publish-lock bypass: `createGridShift` could INSERT a shift with `status='published'` directly, skipping the two-person publish approval flow. Fix removes client-supplied `status` on create and extends the DB trigger to also fire `BEFORE INSERT`.
+- **PR #239** — Revoked anon/authenticated EXECUTE on several internal seed/trigger functions exposed via PostgREST RPC (see §4 — partially effective; more functions remain exposed).
+- **PR #238** — Added a full Playwright E2E suite (10 spec files: auth, role permissions, daily reports, ice ops, incidents/accidents, refrigeration/air quality, ice depth, admin console, multi-tenant isolation, quality checks) across 7 staged role accounts.
+- **PR #237** — Removed a redundant meta-chip header from the Daily Reports form (dead-code cleanup).
+- **PR #236** — Authored an 8-chapter training/onboarding manual, master manual, role-based onboarding paths, print-ready PDFs, and a from-zero "duplicate this software" runbook.
+- **PR #235** — Scheduling grid: keyboard-accessible drag-and-drop (`@dnd-kit`), editable shift times in the assign popover, operating-hours advisory, and visual/interaction lock-down of published shifts.
+- **PR #234** — Default shift-template end time aligned to staff-availability defaults (09:00–17:00).
+- **PR #233** — Scheduling grid: position filter (job-area chips) and expandable multi-shift day cells.
+
+**Pattern:** the team (human + Claude-assisted commits) has been alternating between feature depth on Employee Scheduling and hardening passes on the database security model — a healthy rhythm, but it means scheduling is the newest/least-battle-tested surface area (matches the 0-swap/0-time-off usage data above).
+
+---
+
+## 4. Security Findings (from live Supabase advisors, verified 2026-07-01)
+
+**63 advisor entries total: 62 WARN, 1 INFO, 0 ERROR.**
+
+### Needs action
+
+1. **`information_requests` — unconditionally permissive INSERT policy, open to `anon`.**
+   Policy `information_requests_insert` has `WITH CHECK (true)` for roles `anon, authenticated` — anyone on the internet can insert rows with no validation. Table currently has 0 rows, so no data has been affected, but this is either (a) an intentional public "request more info" form, in which case it should be paired with rate-limiting and a narrower column set, or (b) an oversight. **Needs a decision, not just a fix** — confirm intent before changing.
+
+2. **7 functions still callable by unauthenticated `anon` role via `/rest/v1/rpc/<name>`:** `check_rate_limit`, `enforce_incident_witnesses_cap`, `seed_default_facility_air_quality_config`, `seed_default_facility_modules`, `tg_seed_facility_air_quality_config`, `tg_seed_facility_modules`, `trg_seed_facility_dropdown_options`. PR #239 already revoked EXECUTE on a subset of internal seed/trigger functions — these 5 seed/trigger functions plus `check_rate_limit`/`enforce_incident_witnesses_cap` weren't covered by that pass and take a `facility_id`/similar argument with no internal authorization check, so a direct RPC call could act on a facility a caller has no relationship to. Same fix pattern as PR #239: revoke `EXECUTE` from `anon`/`authenticated`/`public`, keep it callable from triggers and `SECURITY DEFINER` context.
+
+3. **`function_search_path_mutable` — `schedule_swap_set_expiry`** has no fixed `search_path`, meaning it resolves unqualified object names using the caller's `search_path` rather than a pinned one — a schema-hijacking vector if a caller can control search_path. Standard fix: `SET search_path = ''` (or `pg_catalog, public`) on the function.
+
+4. **Leaked-password protection is disabled** in Supabase Auth (HaveIBeenPwned check). One-click enable in Auth settings; no code change needed.
+
+### Not action items (verified as intentional)
+
+- **52 more functions flagged as "authenticated can execute SECURITY DEFINER"** (`current_user_id`, `has_module_access`, `is_facility_admin`, `scheduling_claim_open_shift`, `audit_row_change`, etc.) — this is the standard Supabase pattern for permission-check/RPC helper functions that need `SECURITY DEFINER` to read across RLS boundaries safely. These are almost certainly intentional; a full one-by-one audit would need source access to confirm each function internally re-validates `auth.uid()`/facility scope, which the app's schema comments suggest is the established convention (e.g. `current_employee_id()`, `is_super_admin()`).
+- **`rate_limit_counters` — RLS enabled, no policies.** Flagged INFO, but the table's own comment states this is deliberate: "Reachable ONLY through `public.check_rate_limit()`; RLS is enabled with no policies so direct anon/authenticated access is denied." Correct pattern, no action needed.
+
+---
+
+## 5. Performance Findings (from live Supabase advisors)
+
+**162 advisor entries, all INFO level** (no errors/warnings — this is all "could be tighter," not "something's broken"):
+
+- **105 unused indexes** across 58 tables — expected at this data volume (most tables have single-digit-to-low-hundreds row counts); not a real cost yet, but worth revisiting once production traffic and real query patterns exist. Don't drop these pre-emptively — they were sized for expected access patterns, not current pilot data.
+- **56 foreign keys without a covering index** — the standard next-tier finding after unused indexes; matters more once join volume grows (e.g., `audit_logs.actor_employee_id`, `schedule_shifts.template_origin_id`, various `*_followup_notes.employee_id`). Low urgency at current scale, worth batching into one migration before general availability.
+- **1 `auth_db_connections_absolute` finding** — Auth server connection pool is configured as an absolute count (10) rather than a percentage of the pool, so vertically scaling the Postgres instance won't automatically scale Auth throughput. Cheap fix in Supabase project settings before any real load-testing.
+
+---
+
+## 6. Technical Debt Already Flagged in the Schema Itself
+
+The team has been disciplined about leaving breadcrumbs — several tables carry their own deprecation notes:
+
+- **`role_module_permission_defaults`** — comment: *"DEPRECATED as of migration 77. Source of truth is now `public.user_permissions`. Resolver functions no longer read this table. Drop after admin/roles page is migrated."* Confirm the admin/roles UI has actually cut over, then drop this table.
+- **`module_area_permissions.area_id`** is explicitly a soft/unenforced reference ("no FK is enforced here because the target table varies by module... callers must validate area_id belongs to the same facility before inserting") — worth a defense-in-depth check (a trigger or app-layer assertion) since it's a hand-rolled polymorphic association with no DB-level guarantee.
+
+---
+
+## 7. Domain/Infra Note (worth a 2-minute manual check)
+
+Two Vercel projects both currently list `rinkreports.com` / `www.rinkreports.com` in their domain configuration: `rink-reports-5-6` (the actively-deployed project, `live: true`) and `mfo-rink-reports-2-7` (`live: false`). This is likely just stale metadata from an earlier project rename/migration, but worth a quick check in the Vercel dashboard to confirm the domain is bound to only the live project — a dangling domain binding on a dormant project is a low-probability but easy-to-fix footgun.
+
+---
+
+## 8. Recommended Roadmap
+
+**Now (this week, low-effort/high-value security cleanup):**
+1. Decide intent on `information_requests` anon-insert policy; narrow or rate-limit it either way.
+2. Revoke `anon`/`authenticated` EXECUTE on the 7 remaining exposed functions (§4.2) — same pattern as PR #239.
+3. Pin `search_path` on `schedule_swap_set_expiry`.
+4. Enable leaked-password protection in Auth settings.
+5. Confirm the `mfo-rink-reports-2-7` domain binding is inert.
+
+**Next (before onboarding a second facility / real GA):**
+6. Land the FK-covering-index migration (56 columns) — cheap insurance before multi-tenant write volume grows.
+7. Fix Auth DB connection strategy to percentage-based.
+8. Drop `role_module_permission_defaults` once confirmed unused by the admin UI.
+9. Get real usage into the untested modules (Communications, Air Quality, Accident Reports) — either through the pilot facility's actual workflows or a deliberate UAT pass — before trusting their RLS/business logic under real load. A module with 0 production rows has had zero real-world validation of its write paths.
+10. Merge/resolve PR #240 (publish-lock bypass fix) — this is a genuine security-relevant bug fix sitting unmerged.
+
+**Later (scale-readiness):**
+11. Revisit the unused-index list once real query patterns exist from actual customer traffic — don't act on it now, the data volume is too low to be meaningful.
+12. Add DB-level enforcement (trigger or constraint) for the `module_area_permissions.area_id` polymorphic reference, or explicitly document why app-layer validation is sufficient.
+
+---
+
+## 9. Open Questions for the Product Owner
+
+- Is `information_requests` meant to be a public-facing contact/inquiry form (e.g., on a marketing page), or was the anon-insert policy an oversight?
+- Is there a target date/customer for exiting "1-facility pilot" mode? That affects how urgently items 6–9 above need to land.
+- Are Communications, Air Quality, and Accident Reports intentionally dormant pending a rollout phase, or are they expected to be in active use already and something's blocking adoption (training gap, UI friction, etc.)?
