@@ -1,6 +1,6 @@
 # Rink Reports — 360° Audit & Roadmap
 
-**Prepared:** 2026-07-01
+**Prepared:** 2026-07-01 · **Verification pass:** 2026-07-02 (advisors re-run, usage counts re-queried, deployment history refreshed — deltas noted inline)
 **Scope:** Live production system behind `www.rinkreports.com` — Next.js app (Vercel project `rink-reports-5-6`) + Supabase Postgres backend (project `bqbdgwlhbhabsibjgwmk`, Postgres 17.6).
 **Method:** Direct inspection of the live database schema/data (140 tables), Supabase security & performance advisors, and Vercel deployment history (~25 most recent merged PRs). The application source code itself lives in a separate GitHub repo (`KellyJ386/Rink-Reports-5-6`) that this audit session did not have read access to — findings about code-level behavior below are inferred from commit messages, schema comments, and live data, not from reading the source directly. Anything in that category is flagged as such.
 
@@ -42,7 +42,9 @@ Two security items need attention this week: an anon-writable `information_reque
 
 Reconstructed from Vercel deployment metadata (commit messages), most recent first:
 
-- **PR #240** (open/in-review) — Closed a publish-lock bypass: `createGridShift` could INSERT a shift with `status='published'` directly, skipping the two-person publish approval flow. Fix removes client-supplied `status` on create and extends the DB trigger to also fire `BEFORE INSERT`.
+- **PR #245** (open, very active as of 2026-07-02) — A deep code-level audit of the app itself, run in phases: Phase 0 inventoried 84 routes, ~600 interactive elements, 38 forms, and 31 modals; Phase 1 fanned out five audit agents (navigation, buttons/forms, admin-config propagation, RBAC/security, offline/state) and triaged **3 HIGH, 10 MEDIUM, 26 LOW, 4 INFO** findings; Phase 3 is landing fixes. Notable fixes already pushed on this branch: migration 165 closes a **HIGH facility-admin → cross-tenant super-admin escalation** (profile-update trigger now gates `is_super_admin`/`id` changes to super-admins only), migration 166 adds a module-access gate to `facility_documents` SELECT, open-redirect-safe `redirectTo` on login, several facility-scoping fixes on delete/swap actions, and threshold-fallback alignment for Ice Depth. This PR complements the present report with the code-level depth this audit couldn't reach (see Method note above).
+- **PRs #241–#244** (merged 2026-07-01/02) — Moved `citext`/`pg_trgm` extensions out of the `public` schema (ultimately done manually in the dashboard — Supabase owns extensions as `supabase_admin`, so a migration can't do it — with PR #244 documenting the permanent repo/prod divergence), plus deferred discovery cleanups (job-area docs, brand typography, HIBP notes).
+- **PR #240** (merged) — Closed a publish-lock bypass: `createGridShift` could INSERT a shift with `status='published'` directly, skipping the two-person publish approval flow. Fix removes client-supplied `status` on create and extends the DB trigger to also fire `BEFORE INSERT`. The PR #245 audit independently re-verified this regression as fixed.
 - **PR #239** — Revoked anon/authenticated EXECUTE on several internal seed/trigger functions exposed via PostgREST RPC (see §4 — partially effective; more functions remain exposed).
 - **PR #238** — Added a full Playwright E2E suite (10 spec files: auth, role permissions, daily reports, ice ops, incidents/accidents, refrigeration/air quality, ice depth, admin console, multi-tenant isolation, quality checks) across 7 staged role accounts.
 - **PR #237** — Removed a redundant meta-chip header from the Daily Reports form (dead-code cleanup).
@@ -55,7 +57,7 @@ Reconstructed from Vercel deployment metadata (commit messages), most recent fir
 
 ---
 
-## 4. Security Findings (from live Supabase advisors, verified 2026-07-01)
+## 4. Security Findings (from live Supabase advisors; re-verified unchanged 2026-07-02)
 
 **63 advisor entries total: 62 WARN, 1 INFO, 0 ERROR.**
 
@@ -68,7 +70,7 @@ Reconstructed from Vercel deployment metadata (commit messages), most recent fir
 
 3. **`function_search_path_mutable` — `schedule_swap_set_expiry`** has no fixed `search_path`, meaning it resolves unqualified object names using the caller's `search_path` rather than a pinned one — a schema-hijacking vector if a caller can control search_path. Standard fix: `SET search_path = ''` (or `pg_catalog, public`) on the function.
 
-4. **Leaked-password protection is disabled** in Supabase Auth (HaveIBeenPwned check). One-click enable in Auth settings; no code change needed.
+4. **Leaked-password protection is disabled** in Supabase Auth (HaveIBeenPwned check). One-click enable in Auth settings; no code change needed. *(Re-verified still disabled 2026-07-02 — PR #243 touched HIBP-related docs but the Auth setting itself remains off.)*
 
 ### Not action items (verified as intentional)
 
@@ -116,7 +118,7 @@ Two Vercel projects both currently list `rinkreports.com` / `www.rinkreports.com
 7. Fix Auth DB connection strategy to percentage-based.
 8. Drop `role_module_permission_defaults` once confirmed unused by the admin UI.
 9. Get real usage into the untested modules (Communications, Air Quality, Accident Reports) — either through the pilot facility's actual workflows or a deliberate UAT pass — before trusting their RLS/business logic under real load. A module with 0 production rows has had zero real-world validation of its write paths.
-10. Merge/resolve PR #240 (publish-lock bypass fix) — this is a genuine security-relevant bug fix sitting unmerged.
+10. ~~Merge/resolve PR #240 (publish-lock bypass fix)~~ — **Done as of 2026-07-02**: merged, and independently re-verified fixed by the PR #245 audit. Replacement item: land PR #245's remaining phases — it carries a HIGH cross-tenant privilege-escalation fix (migration 165) and a facility-documents access gate (migration 166) that shouldn't sit unmerged long.
 
 **Later (scale-readiness):**
 11. Revisit the unused-index list once real query patterns exist from actual customer traffic — don't act on it now, the data volume is too low to be meaningful.
