@@ -1,5 +1,23 @@
 # Fix Plan — "Install Rink Reports" Button Not Functional
 
+> **STATUS UPDATE (2026-07-05): IMPLEMENTED — awaiting push/PR into the app repo.**
+> The fix is fully built and verified against `KellyJ386/Rink-Reports-5-6` (commit `aeaa25a`,
+> branch `claude/install-button-fix` in a session clone). This session had read-only access
+> to that repo, so the commit could not be pushed from here; the complete change is preserved
+> as [`patches/0001-fix-install-banner-ios.patch`](patches/0001-fix-install-banner-ios.patch)
+> in this repo. To land it: in a session with write access to Rink-Reports-5-6, run
+> `git checkout -b claude/install-button-fix && git am patches/0001-fix-install-banner-ios.patch`
+> (or just ask Claude to apply the patch and open the PR).
+>
+> What shipped, per the phases below: Phase 0 found the PWA foundation already solid
+> (manifest + icons + service worker + Android `beforeinstallprompt` handling all present) —
+> the defect was iOS-only. Phase 2's platform-aware banner is implemented: expandable
+> device-correct steps on iOS Safari (iPhone vs iPad share-button location), an
+> "open in Safari" card with Copy Link on non-Safari iOS browsers (the user's screenshot
+> case), unchanged native install on Chromium, a 14-day dismissal cool-down, an explicit
+> apple-touch-icon, and PostHog instrumentation. Verified with 16 new unit tests plus an
+> 18-check Playwright pass against the production build (all green).
+
 **Prepared:** 2026-07-05
 **Reported symptom:** On mobile (iPhone screenshot, `www.rinkreports.com`), the "Install Rink Reports" banner at the bottom of the landing page does nothing when tapped. Only the ✕ (dismiss) works.
 **Where the fix lands:** The app source repo (`KellyJ386/Rink-Reports-5-6`) — this docs repo carries the plan only. This session could not read that repo or fetch the live site (network policy), so Phase 0 below re-verifies the assumptions before code changes.

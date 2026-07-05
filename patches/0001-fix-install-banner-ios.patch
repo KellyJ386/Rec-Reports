@@ -1,0 +1,719 @@
+From aeaa25a8b869701937d4db5d4458477e9a6713fa Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 5 Jul 2026 23:22:56 +0000
+Subject: [PATCH] Fix non-functional install banner on iOS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The install banner told every iOS user to "tap the Share button below,
+then Add to Home Screen" — instructions that are wrong on iPad (Share is
+top-right), impossible in non-Safari iOS browsers and in-app webviews
+(no Add to Home Screen), and attached to a card that looks tappable but
+did nothing, so users reported the install button as broken.
+
+- Extract pure, unit-tested environment classification into
+  src/lib/pwa/install-env.ts (iOS Safari vs non-Safari vs webview,
+  iPhone vs iPad incl. iPadOS desktop-class UA, dismissal cool-down).
+- iOS Safari: whole card now toggles numbered, device-correct
+  install steps — no dead tap target.
+- iOS non-Safari/webviews: honest "open in Safari" guidance with a
+  Copy Link button instead of impossible instructions.
+- Android/Chromium: unchanged real Install button via
+  beforeinstallprompt.
+- Dismissal now stores a timestamp with a 14-day cool-down instead of
+  hiding forever (permanent only after actual install); the legacy "1"
+  value intentionally reads as expired so everyone who dismissed the
+  broken banner sees the fixed one once.
+- Add explicit apple-touch-icon so A2HS uses the app icon, not a
+  page screenshot.
+- Add captureClientEvent() (gated, lazy PostHog) and instrument banner
+  impressions, prompt outcomes, installs, and copy-link usage.
+
+Verified via Playwright against the production build: 18 checks across
+iPhone/iPad Safari, iOS Chrome, desktop Chromium (synthetic
+beforeinstallprompt), standalone mode, and manifest/icon serving.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M7YDVywyofrr6KBiAJqmqa
+---
+ src/app/layout.tsx                        |   5 +
+ src/components/app/pwa-install-prompt.tsx | 287 ++++++++++++++++------
+ src/lib/observability/capture-client.ts   |  15 ++
+ src/lib/pwa/install-env.test.ts           | 118 +++++++++
+ src/lib/pwa/install-env.ts                |  78 ++++++
+ 5 files changed, 424 insertions(+), 79 deletions(-)
+ create mode 100644 src/lib/pwa/install-env.test.ts
+ create mode 100644 src/lib/pwa/install-env.ts
+
+diff --git a/src/app/layout.tsx b/src/app/layout.tsx
+index fec7f87..b32cb8a 100644
+--- a/src/app/layout.tsx
++++ b/src/app/layout.tsx
+@@ -9,6 +9,11 @@ export const metadata: Metadata = {
+   title: "MFO / Rink Reports",
+   description: "Operations console for Max Facility ice rinks.",
+   manifest: "/manifest.json",
++  icons: {
++    // Explicit apple-touch-icon — without it, iOS Add-to-Home-Screen falls
++    // back to a page screenshot instead of the app icon.
++    apple: [{ url: "/icon-192.png", sizes: "192x192", type: "image/png" }],
++  },
+   appleWebApp: {
+     capable: true,
+     statusBarStyle: "black-translucent",
+diff --git a/src/components/app/pwa-install-prompt.tsx b/src/components/app/pwa-install-prompt.tsx
+index a664310..93bfcb9 100644
+--- a/src/components/app/pwa-install-prompt.tsx
++++ b/src/components/app/pwa-install-prompt.tsx
+@@ -3,17 +3,25 @@
+ // =============================================================================
+ // PwaInstallPrompt — contextual "install to home screen" banner.
+ //
+-// Two platforms, two flows:
++// Three environments, three flows (classification in @/lib/pwa/install-env):
+ //  - Android / Chromium: the browser fires `beforeinstallprompt`. We capture
+ //    it, suppress the default mini-infobar, and drive the *native* install
+ //    dialog from our own button via `prompt()`.
+ //  - iOS Safari: there is no `beforeinstallprompt`. Installing is a manual
+-//    "Share → Add to Home Screen" gesture, so we show instructions instead.
++//    "Share → Add to Home Screen" gesture, so the card expands into numbered,
++//    device-correct steps (iPhone: Share in the bottom toolbar; iPad: top
++//    right). The whole card is tappable — an install banner must never look
++//    like a button and do nothing.
++//  - iOS non-Safari (Chrome/Firefox/Edge on iOS, AI browsers, in-app
++//    webviews): these generally cannot Add to Home Screen, so Safari-style
++//    instructions are a dead end. We say so honestly and offer a Copy Link
++//    button for pasting into Safari (iOS gives web pages no "open in Safari"
++//    API).
+ //
+ // The banner is:
+ //  - hidden when the app is already running standalone (installed),
+-//  - dismissible, with the dismissal persisted in localStorage so we don't
+-//    nag on every visit,
++//  - dismissible, persisted with a 14-day cool-down (permanent only after a
++//    real install) — see isDismissalActive for the legacy-value story,
+ //  - styled with the RinkReports brand tokens (Navy #001A3A surface, brand
+ //    `rr-green` #4DFF00 accent). The navy surface is a fixed brand color for an
+ //    intentionally branded banner, so it reads the same in light and dark mode;
+@@ -27,12 +35,22 @@
+ // Supabase or the offline IndexedDB queue.
+ // =============================================================================
+ 
+-import { useSyncExternalStore } from "react"
+-import { Share, SquarePlus, X } from "lucide-react"
++import { useState, useSyncExternalStore } from "react"
++import { ChevronDown, Copy, Share, SquarePlus, X } from "lucide-react"
++import { toast } from "sonner"
+ 
+-// localStorage flag so a dismissal sticks across visits. Bump the suffix if we
+-// ever want to re-surface the prompt to everyone (e.g. after a big update).
++import { captureClientEvent } from "@/lib/observability/capture-client"
++import {
++  detectInstallEnv,
++  isDismissalActive,
++  type InstallEnv,
++} from "@/lib/pwa/install-env"
++
++// Dismissals store a timestamp (ms epoch) and expire after the cool-down in
++// install-env.ts. The pre-cool-down value "1" reads as expired on purpose.
+ const DISMISS_KEY = "rr-pwa-install-dismissed"
++// Set once the app is actually installed — never prompt again after that.
++const INSTALLED_KEY = "rr-pwa-installed"
+ 
+ // The `beforeinstallprompt` event isn't in the standard DOM lib types yet.
+ interface BeforeInstallPromptEvent extends Event {
+@@ -40,20 +58,6 @@ interface BeforeInstallPromptEvent extends Event {
+   userChoice: Promise<{ outcome: "accepted" | "dismissed" }>
+ }
+ 
+-type Platform = "android" | "ios" | "other"
+-
+-function detectPlatform(): Platform {
+-  if (typeof navigator === "undefined") return "other"
+-  const ua = navigator.userAgent
+-  // iPadOS 13+ reports as "Macintosh" but exposes touch — treat touch Macs as iOS.
+-  const isIOS =
+-    /iphone|ipad|ipod/i.test(ua) ||
+-    (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1)
+-  if (isIOS) return "ios"
+-  if (/android/i.test(ua)) return "android"
+-  return "other"
+-}
+-
+ // True when the app is already installed / launched from the home screen.
+ function isStandalone(): boolean {
+   if (typeof window === "undefined") return false
+@@ -68,47 +72,67 @@ function isStandalone(): boolean {
+ // Module-scoped install store. State lives outside React so multiple subtrees
+ // share one source of truth and we never call setState inside an effect.
+ // ---------------------------------------------------------------------------
+-type Mode = "ios" | "android"
++type Mode = "android" | "ios-safari" | "ios-other"
+ interface Snapshot {
+   show: boolean
+   mode: Mode | null
++  device: "iphone" | "ipad"
+ }
+ 
+ // The captured Android event, replayed when the user taps "Install".
+ let deferredPrompt: BeforeInstallPromptEvent | null = null
+ let dismissed = false
+ let installed = false
+-let platform: Platform = "other"
++let env: InstallEnv = { os: "other" }
+ let initialized = false
+ 
+ // Cached so getSnapshot returns a stable reference until something changes
+ // (a fresh object every call would loop useSyncExternalStore forever).
+-let snapshot: Snapshot = { show: false, mode: null }
++let snapshot: Snapshot = { show: false, mode: null, device: "iphone" }
+ const listeners = new Set<() => void>()
+ 
+ function recompute() {
+   let show = false
+   let mode: Mode | null = null
++  let device: Snapshot["device"] = "iphone"
+   if (!dismissed && !installed) {
+-    if (platform === "ios") {
+-      // iOS has no install event — surface the manual instructions.
++    if (env.os === "ios") {
++      // iOS has no install event — surface manual guidance, tailored to
++      // whether this browser can actually Add to Home Screen.
+       show = true
+-      mode = "ios"
++      mode = env.browser === "safari" ? "ios-safari" : "ios-other"
++      device = env.device
+     } else if (deferredPrompt) {
+       // Android/Chromium told us the app is installable.
+       show = true
+       mode = "android"
+     }
+   }
+-  if (show !== snapshot.show || mode !== snapshot.mode) {
+-    snapshot = { show, mode }
++  if (
++    show !== snapshot.show ||
++    mode !== snapshot.mode ||
++    device !== snapshot.device
++  ) {
++    const appeared = show && !snapshot.show
++    snapshot = { show, mode, device }
+     listeners.forEach((l) => l())
++    if (appeared && mode) {
++      captureClientEvent("pwa_install_banner_shown", { mode })
++    }
++  }
++}
++
++function persistDismissedAt() {
++  try {
++    window.localStorage.setItem(DISMISS_KEY, String(Date.now()))
++  } catch {
++    // ignore quota / disabled storage
+   }
+ }
+ 
+-function persistDismissed() {
++function persistInstalled() {
+   try {
+-    window.localStorage.setItem(DISMISS_KEY, "1")
++    window.localStorage.setItem(INSTALLED_KEY, "1")
+   } catch {
+     // ignore quota / disabled storage
+   }
+@@ -123,7 +147,8 @@ function onBeforeInstallPrompt(e: Event) {
+ function onAppInstalled() {
+   installed = true
+   deferredPrompt = null
+-  persistDismissed() // never nag again once installed
++  persistInstalled() // never nag again once installed
++  captureClientEvent("pwa_installed")
+   recompute()
+ }
+ 
+@@ -134,12 +159,17 @@ function subscribe(cb: () => void): () => void {
+   if (!initialized) {
+     initialized = true
+     try {
+-      dismissed = window.localStorage.getItem(DISMISS_KEY) === "1"
++      dismissed = isDismissalActive(
++        window.localStorage.getItem(DISMISS_KEY),
++        Date.now(),
++      )
++      installed = window.localStorage.getItem(INSTALLED_KEY) === "1"
+     } catch {
+       dismissed = false
++      installed = false
+     }
+-    installed = isStandalone()
+-    platform = detectPlatform()
++    installed = installed || isStandalone()
++    env = detectInstallEnv(navigator.userAgent, navigator.maxTouchPoints ?? 0)
+     window.addEventListener("beforeinstallprompt", onBeforeInstallPrompt)
+     window.addEventListener("appinstalled", onAppInstalled)
+     recompute()
+@@ -160,13 +190,17 @@ function getSnapshot(): Snapshot {
+ 
+ // SSR (and the first client render before subscribe runs) both see the hidden
+ // default, so hydration matches and the banner only appears post-mount.
++const serverSnapshot: Snapshot = { show: false, mode: null, device: "iphone" }
+ function getServerSnapshot(): Snapshot {
+-  return { show: false, mode: null }
++  return serverSnapshot
+ }
+ 
+ function dismiss() {
++  captureClientEvent("pwa_install_banner_dismissed", {
++    mode: snapshot.mode ?? "unknown",
++  })
+   dismissed = true
+-  persistDismissed()
++  persistDismissedAt()
+   recompute()
+ }
+ 
+@@ -175,30 +209,50 @@ async function runInstall() {
+   const evt = deferredPrompt
+   await evt.prompt()
+   const { outcome } = await evt.userChoice
++  captureClientEvent("pwa_install_prompt_result", { outcome })
+   // A used prompt can't be replayed; drop it and close the banner either way.
+   deferredPrompt = null
+-  if (outcome === "accepted") {
+-    dismissed = true
+-    persistDismissed()
+-  } else {
+-    // Treat a declined prompt as a dismissal for this session too.
+-    dismissed = true
+-  }
++  // Treat a declined native prompt like a dismissal (cool-down applies);
++  // an accepted one is followed by `appinstalled`, which hides it for good.
++  dismissed = true
++  persistDismissedAt()
+   recompute()
+ }
+ 
++async function copyPageLink() {
++  const url = window.location.href
++  try {
++    await navigator.clipboard.writeText(url)
++    captureClientEvent("pwa_install_copy_link", { copied: true })
++    toast.success("Link copied — open Safari and paste it in the address bar.")
++  } catch {
++    captureClientEvent("pwa_install_copy_link", { copied: false })
++    toast.error("Couldn't copy the link. In Safari, go to rinkreports.com.")
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // View
+ // ---------------------------------------------------------------------------
+ export function PwaInstallPrompt() {
+-  const { show, mode } = useSyncExternalStore(
++  const { show, mode, device } = useSyncExternalStore(
+     subscribe,
+     getSnapshot,
+     getServerSnapshot,
+   )
++  // Whether the iOS Safari card is expanded into the numbered steps. Local
++  // render state, not shared install state, so plain useState is fine here.
++  const [expanded, setExpanded] = useState(false)
+ 
+   if (!show) return null
+ 
++  const toggleSteps = () => {
++    setExpanded((open) => {
++      if (!open) captureClientEvent("pwa_install_ios_steps_expanded")
++      return !open
++    })
++  }
++
+   return (
+     <div
+       role="dialog"
+@@ -213,42 +267,117 @@ export function PwaInstallPrompt() {
+         </span>
+ 
+         <div className="min-w-0 flex-1">
+-          <p
+-            className="text-base font-semibold"
+-            style={{ fontFamily: "var(--font-anton), sans-serif" }}
+-          >
+-            Install Rink Reports
+-          </p>
++          {mode === "ios-safari" ? (
++            // The whole title/summary area is the expand toggle so there is
++            // no dead-looking tap target — tapping anywhere useful reacts.
++            <>
++              <button
++                type="button"
++                onClick={toggleSteps}
++                aria-expanded={expanded}
++                className="block w-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rr-green rounded-md"
++              >
++                <p
++                  className="flex items-center gap-1.5 text-base font-semibold"
++                  style={{ fontFamily: "var(--font-anton), sans-serif" }}
++                >
++                  Install Rink Reports
++                  <ChevronDown
++                    className={`h-4 w-4 text-rr-green transition-transform ${expanded ? "rotate-180" : ""}`}
++                    aria-hidden
++                  />
++                </p>
++                <p className="mt-1 text-sm leading-snug text-white/80">
++                  Add it to your home screen for one-tap, full-screen access.{" "}
++                  <span className="font-semibold text-rr-green">
++                    {expanded ? "Hide steps" : "Show me how"}
++                  </span>
++                </p>
++              </button>
+ 
+-          {mode === "ios" ? (
+-            <p className="mt-1 text-sm leading-snug text-white/80">
+-              Tap the{" "}
+-              <Share
+-                className="inline h-4 w-4 -translate-y-0.5 text-rr-green"
+-                aria-label="Share"
+-              />{" "}
+-              Share button below, then choose{" "}
+-              <span className="font-semibold text-white">
+-                &ldquo;Add to Home Screen&rdquo;
+-              </span>
+-              .
+-            </p>
++              {expanded && (
++                <ol className="mt-3 list-none space-y-2 text-sm leading-snug text-white/80">
++                  <li className="flex gap-2">
++                    <span className="font-semibold text-rr-green">1.</span>
++                    <span>
++                      Tap the{" "}
++                      <Share
++                        className="inline h-4 w-4 -translate-y-0.5 text-rr-green"
++                        aria-label="Share"
++                      />{" "}
++                      <span className="font-semibold text-white">Share</span>{" "}
++                      button{" "}
++                      {device === "ipad"
++                        ? "at the top right of the window"
++                        : "in the toolbar at the bottom of the screen"}
++                      .
++                    </span>
++                  </li>
++                  <li className="flex gap-2">
++                    <span className="font-semibold text-rr-green">2.</span>
++                    <span>
++                      Scroll down and choose{" "}
++                      <span className="font-semibold text-white">
++                        &ldquo;Add to Home Screen&rdquo;
++                      </span>
++                      .
++                    </span>
++                  </li>
++                  <li className="flex gap-2">
++                    <span className="font-semibold text-rr-green">3.</span>
++                    <span>
++                      Tap{" "}
++                      <span className="font-semibold text-white">
++                        &ldquo;Add&rdquo;
++                      </span>{" "}
++                      — Rink Reports will appear on your home screen.
++                    </span>
++                  </li>
++                </ol>
++              )}
++            </>
+           ) : (
+-            <p className="mt-1 text-sm leading-snug text-white/80">
+-              Add it to your home screen for one-tap, full-screen access — works
+-              offline too.
+-            </p>
+-          )}
++            <>
++              <p
++                className="text-base font-semibold"
++                style={{ fontFamily: "var(--font-anton), sans-serif" }}
++              >
++                Install Rink Reports
++              </p>
+ 
+-          {/* Android gets a real install button; iOS is instructions-only. */}
+-          {mode === "android" && (
+-            <button
+-              type="button"
+-              onClick={runInstall}
+-              className="mt-3 inline-flex h-10 items-center justify-center rounded-lg bg-rr-green px-4 text-sm font-semibold text-[#001A3A] transition-colors hover:bg-[var(--rr-green-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rr-green focus-visible:ring-offset-2 focus-visible:ring-offset-[#001A3A]"
+-            >
+-              Install app
+-            </button>
++              {mode === "ios-other" ? (
++                <>
++                  <p className="mt-1 text-sm leading-snug text-white/80">
++                    This browser can&rsquo;t add apps to your home screen. Open
++                    this page in{" "}
++                    <span className="font-semibold text-white">Safari</span> to
++                    install.
++                  </p>
++                  <button
++                    type="button"
++                    onClick={copyPageLink}
++                    className="mt-3 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-rr-green px-4 text-sm font-semibold text-[#001A3A] transition-colors hover:bg-[var(--rr-green-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rr-green focus-visible:ring-offset-2 focus-visible:ring-offset-[#001A3A]"
++                  >
++                    <Copy className="h-4 w-4" aria-hidden />
++                    Copy link for Safari
++                  </button>
++                </>
++              ) : (
++                <>
++                  <p className="mt-1 text-sm leading-snug text-white/80">
++                    Add it to your home screen for one-tap, full-screen access
++                    — works offline too.
++                  </p>
++                  <button
++                    type="button"
++                    onClick={runInstall}
++                    className="mt-3 inline-flex h-10 items-center justify-center rounded-lg bg-rr-green px-4 text-sm font-semibold text-[#001A3A] transition-colors hover:bg-[var(--rr-green-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rr-green focus-visible:ring-offset-2 focus-visible:ring-offset-[#001A3A]"
++                  >
++                    Install app
++                  </button>
++                </>
++              )}
++            </>
+           )}
+         </div>
+ 
+diff --git a/src/lib/observability/capture-client.ts b/src/lib/observability/capture-client.ts
+index 2a6d62f..fe40efc 100644
+--- a/src/lib/observability/capture-client.ts
++++ b/src/lib/observability/capture-client.ts
+@@ -25,3 +25,18 @@ export function captureClientException(
+     })
+     .catch(() => {})
+ }
++
++// Manual event capture with the same gate + lazy import. Only pass
++// non-sensitive, enum-like properties (autocapture is off for privacy;
++// keep manual events just as clean).
++export function captureClientEvent(
++  event: string,
++  properties?: Record<string, string | number | boolean>,
++): void {
++  if (!clientPosthogEnabled()) return
++  void import("posthog-js")
++    .then(({ default: posthog }) => {
++      posthog.capture(event, properties)
++    })
++    .catch(() => {})
++}
+diff --git a/src/lib/pwa/install-env.test.ts b/src/lib/pwa/install-env.test.ts
+new file mode 100644
+index 0000000..90b225d
+--- /dev/null
++++ b/src/lib/pwa/install-env.test.ts
+@@ -0,0 +1,118 @@
++import { describe, expect, it } from "vitest"
++
++import {
++  DISMISS_COOLDOWN_MS,
++  detectInstallEnv,
++  isDismissalActive,
++} from "./install-env"
++
++// Real-world user agents, abbreviated where harmless.
++const UA = {
++  iphoneSafari:
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
++  ipadSafari:
++    "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
++  // iPadOS 13+ desktop-class UA: says Macintosh, exposes touch.
++  ipadDesktopUA:
++    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
++  iphoneChrome:
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/125.0.6422.80 Mobile/15E148 Safari/604.1",
++  iphoneFirefox:
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/126.0 Mobile/15E148 Safari/605.1.15",
++  iphoneEdge:
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 EdgiOS/125.0.2535.60 Mobile/15E148 Safari/605.1.15",
++  iphoneGoogleApp:
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) GSA/320.0.638848745 Mobile/15E148 Safari/604.1",
++  // Facebook in-app webview: no Safari/ token.
++  iphoneFacebook:
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/466.0.0.36.107;]",
++  // Bare webview (e.g. SFSafariViewController-less embed): no Safari/ token.
++  iphoneBareWebview:
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
++  androidChrome:
++    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36",
++  desktopChrome:
++    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
++  desktopMacSafari:
++    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
++}
++
++describe("detectInstallEnv", () => {
++  it("classifies iPhone Safari", () => {
++    expect(detectInstallEnv(UA.iphoneSafari, 5)).toEqual({
++      os: "ios",
++      browser: "safari",
++      device: "iphone",
++    })
++  })
++
++  it("classifies iPad Safari (legacy iPad UA)", () => {
++    expect(detectInstallEnv(UA.ipadSafari, 5)).toEqual({
++      os: "ios",
++      browser: "safari",
++      device: "ipad",
++    })
++  })
++
++  it("classifies iPadOS 13+ desktop-class UA (Macintosh + touch) as iPad", () => {
++    expect(detectInstallEnv(UA.ipadDesktopUA, 5)).toEqual({
++      os: "ios",
++      browser: "safari",
++      device: "ipad",
++    })
++  })
++
++  it("does NOT classify a real (non-touch) Mac as iOS", () => {
++    expect(detectInstallEnv(UA.desktopMacSafari, 0)).toEqual({ os: "other" })
++  })
++
++  it.each([
++    ["Chrome iOS", UA.iphoneChrome],
++    ["Firefox iOS", UA.iphoneFirefox],
++    ["Edge iOS", UA.iphoneEdge],
++    ["Google app", UA.iphoneGoogleApp],
++    ["Facebook webview", UA.iphoneFacebook],
++    ["bare webview", UA.iphoneBareWebview],
++  ])("classifies %s as ios/other", (_name, ua) => {
++    expect(detectInstallEnv(ua, 5)).toEqual({
++      os: "ios",
++      browser: "other",
++      device: "iphone",
++    })
++  })
++
++  it("classifies Android and desktop Chromium as non-iOS", () => {
++    expect(detectInstallEnv(UA.androidChrome, 5)).toEqual({ os: "other" })
++    expect(detectInstallEnv(UA.desktopChrome, 0)).toEqual({ os: "other" })
++  })
++})
++
++describe("isDismissalActive", () => {
++  const now = 1_750_000_000_000
++
++  it("is inactive when nothing is stored", () => {
++    expect(isDismissalActive(null, now)).toBe(false)
++    expect(isDismissalActive("", now)).toBe(false)
++  })
++
++  it("is active within the cool-down window", () => {
++    expect(isDismissalActive(String(now - 1000), now)).toBe(true)
++    expect(
++      isDismissalActive(String(now - DISMISS_COOLDOWN_MS + 1), now),
++    ).toBe(true)
++  })
++
++  it("expires after the cool-down window", () => {
++    expect(isDismissalActive(String(now - DISMISS_COOLDOWN_MS), now)).toBe(
++      false,
++    )
++  })
++
++  it("treats the legacy permanent value '1' as expired (re-surface once)", () => {
++    expect(isDismissalActive("1", now)).toBe(false)
++  })
++
++  it("ignores garbage values", () => {
++    expect(isDismissalActive("not-a-number", now)).toBe(false)
++  })
++})
+diff --git a/src/lib/pwa/install-env.ts b/src/lib/pwa/install-env.ts
+new file mode 100644
+index 0000000..1308b8f
+--- /dev/null
++++ b/src/lib/pwa/install-env.ts
+@@ -0,0 +1,78 @@
++// =============================================================================
++// Pure install-environment classification for the PWA install banner.
++//
++// Kept dependency-free (no DOM access — callers pass in the user agent and
++// touch-point count) so it can be unit-tested in vitest's plain Node
++// environment, per the repo's testing convention.
++//
++// Why classification matters: "install" means something different per browser.
++//  - Chromium (Android/desktop) fires `beforeinstallprompt`, so a real Install
++//    button works. That path is driven by the event, not by UA sniffing —
++//    this module only needs to say "not iOS".
++//  - iOS *Safari* can install only via the manual Share → Add to Home Screen
++//    gesture, and the Share button lives in a different place on iPhone
++//    (bottom toolbar) vs iPad (top right).
++//  - iOS *non-Safari* browsers (Chrome/Firefox/Edge on iOS, AI browsers,
++//    in-app webviews) generally cannot Add to Home Screen at all — telling
++//    users to "tap the Share button below" there is a dead end. The only
++//    honest instruction is "open this in Safari".
++// =============================================================================
++
++export type InstallEnv =
++  | { os: "ios"; browser: "safari" | "other"; device: "iphone" | "ipad" }
++  | { os: "other" }
++
++// Browser tokens that identify a non-Safari iOS browser. Every third-party
++// iOS browser ships WebKit but brands its UA: Chrome=CriOS, Firefox=FxiOS,
++// Edge=EdgiOS, Opera=OPiOS/OPT, Google app=GSA, plus DuckDuckGo/Brave/Yandex
++// and newer AI browsers (Comet, Arc).
++const IOS_NON_SAFARI =
++  /crios|fxios|edgios|opios|\bopt\/|gsa\/|duckduckgo|brave|yabrowser|comet|arc\//i
++
++// In-app webviews (Facebook, Instagram, Messenger, Line, WeChat, Snapchat)
++// brand the UA and usually drop the trailing "Safari/xxx" token too — but
++// match them explicitly in case they keep it.
++const IOS_WEBVIEW =
++  /fbav|fban|fb_iab|instagram|\bline\/|micromessenger|snapchat/i
++
++export function detectInstallEnv(
++  ua: string,
++  maxTouchPoints: number,
++): InstallEnv {
++  // iPadOS 13+ reports as "Macintosh" but exposes multi-touch.
++  const isIpad =
++    /ipad/i.test(ua) || (/macintosh/i.test(ua) && maxTouchPoints > 1)
++  const isIOS = isIpad || /iphone|ipod/i.test(ua)
++  if (!isIOS) return { os: "other" }
++
++  // Real Safari keeps its "Safari/xxx" token and carries no rival branding.
++  // Webviews typically omit the Safari token entirely, so requiring it
++  // catches unbranded in-app browsers as well.
++  const isSafari =
++    /safari\//i.test(ua) && !IOS_NON_SAFARI.test(ua) && !IOS_WEBVIEW.test(ua)
++
++  return {
++    os: "ios",
++    browser: isSafari ? "safari" : "other",
++    device: isIpad ? "ipad" : "iphone",
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Dismissal cool-down. The banner used to store "1" forever on dismiss; now it
++// stores a timestamp and re-surfaces after the cool-down (installing is
++// genuinely useful, but nagging forever is not — and never asking again means
++// one accidental ✕ hides the feature permanently).
++// ---------------------------------------------------------------------------
++export const DISMISS_COOLDOWN_MS = 14 * 24 * 60 * 60 * 1000 // 14 days
++
++// `raw` is whatever localStorage holds. The legacy value "1" (pre-cool-down
++// permanent dismissal) parses as epoch-ms 1 and therefore reads as expired —
++// intentional, so everyone who dismissed the old broken banner sees the fixed
++// one exactly once more.
++export function isDismissalActive(raw: string | null, now: number): boolean {
++  if (!raw) return false
++  const dismissedAt = Number(raw)
++  if (!Number.isFinite(dismissedAt)) return false
++  return now - dismissedAt < DISMISS_COOLDOWN_MS
++}
+-- 
+2.43.0
+
