@@ -1,5 +1,17 @@
 # Admin-Area Fixes — 2026-07-06
 
+> **Status update (later the same day):** the proposed migrations below were finalized
+> against the actual app source and landed as
+> [Rink-Reports-5-6 PR #255](https://github.com/KellyJ386/Rink-Reports-5-6/pull/255)
+> (migrations 175–177 + regenerated schema snapshot and DB types). The `proposed-migrations/`
+> files in this folder are the earlier DB-only drafts, kept for the record — **the PR
+> versions supersede them** (notably: `check_rate_limit` keeps anon EXECUTE because the
+> public information-requests API route calls it under the anon key, and the employee-counts
+> RPC is facility-scoped rather than super-admin-only because `/admin/facility` also calls it).
+> Also done since: the two June 30 alerts were acknowledged + resolved (as Kelly Johnson),
+> and both stranded logins were deactivated. The only remaining human step is the
+> leaked-password toggle (see below).
+
 Follow-up to `../ADMIN-AREA-REVIEW.md`. Two kinds of work, kept deliberately separate:
 
 ## Applied directly to production (data-only, no schema drift)
@@ -19,7 +31,8 @@ Schema changes were **not** applied to prod — doing so would silently diverge 
 
 ## Still needs a human
 
-- **Acknowledge/resolve the two June 30 alerts** (critical incident "ambulance called", high refrigeration OOR) in the Communications console — routing now exists for *future* alerts, but these two predate it.
-- **Enable leaked-password protection**: Supabase Dashboard → Authentication → Settings (one toggle).
-- **Decide the two stranded logins** (`kellygjohnson@yahoo.com` — no employee record, no permissions; `geeka386@yahoo.com` — no employee record): link to employees or deactivate.
+- ~~Acknowledge/resolve the two June 30 alerts~~ — **done 2026-07-06** (acknowledged + resolved, attributed to Kelly Johnson, with a retroactive note).
+- **Enable leaked-password protection**: Supabase Dashboard → Authentication → Settings → enable "Leaked password protection" (one toggle; there is no API for this, so it genuinely needs the click).
+- ~~Decide the two stranded logins~~ — **done 2026-07-06**: both `kellygjohnson@yahoo.com` and `geeka386@yahoo.com` deactivated (`is_active=false`; reversible anytime).
 - **Routing noise preference**: rules currently match *all* severities. If admins get too much mail once volume grows, set each rule's severity to `critical`/`high` in the console.
+- **Merge [PR #255](https://github.com/KellyJ386/Rink-Reports-5-6/pull/255)** — merging auto-applies migrations 175–177 to the live database via the Deploy Migrations workflow.
