@@ -157,7 +157,17 @@ The heart of the admin area: 5 roles (super_admin 0 / admin 1 / manager 2 / staf
 
 ---
 
-## 5. What I Could Not Verify From Here
+## 5. Status Update — 2026-07-06, fixes applied (see `admin-fixes/`)
+
+Applied live (data-only): the 15 orphaned area-permission rows are **purged** (snapshot committed in `admin-fixes/`), and **7 default alert routing rules** now route every module's alerts to the 5 admin-role employees (fix-list items 1–2 partially done; the two pre-existing June 30 alerts still need manual acknowledgement).
+
+Upgraded finding while fixing item 3: `facility_paperwork` isn't just missing role defaults — the `user_permissions` CHECK constraint **doesn't allow the module at all**, and the canonical grant matrix (`canonical_role_permission_grants()`) omits it, so no one except a super-admin can ever be granted access. A data-only seed was attempted and cleanly reverted (it would have broken `apply_role_permission_defaults()` until the constraint is widened). The complete fix — constraint, canonical matrix, backfill, reapply — is packaged as `admin-fixes/proposed-migrations/A_*.sql`, with the integrity triggers and RPC/public-form hardening as `B_*.sql` / `C_*.sql`, ready to renumber and drop into the app repo's migration chain. Also resolved: §2.1's `manual_override` mystery is a UI-path issue — `apply_role_permission_defaults()` itself stamps sources correctly and preserves overrides.
+
+Still needs a human: acknowledge the two June 30 alerts, flip the HIBP toggle, decide the two stranded logins, and land the three migrations in the app repo.
+
+---
+
+## 6. What I Could Not Verify From Here
 
 - Admin **UI** correctness (forms, empty states, navigation, error surfacing) — needs the `Rink-Reports-5-6` repo attached to a session. The recent module-review PRs (#249, #251) show this is being worked through module-by-module and repeatedly found the same class of bug (admin console not gated on the module-scoped grant; the communications console had the pattern right first). Modules not yet deep-reviewed by that series, per deployment history: **Daily Reports, Refrigeration, Air Quality, Ice Depth admin consoles** — worth the same treatment.
 - Whether an audit-log viewer, retention enforcement job, or export/PDF admin page exist in the UI at all.
