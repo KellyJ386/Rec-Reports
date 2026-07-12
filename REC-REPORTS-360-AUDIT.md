@@ -2,7 +2,7 @@
 
 > **Product name:** the product is **Rec Reports**. Its live infrastructure still carries the legacy "Rink Reports" branding — the `rinkreports.com` domain, the Vercel project `rink-reports-5-6`, the Supabase project "Rink Reports 5-6", and the GitHub repo `Rink-Reports-5-6`. Those literal identifiers are left unchanged below because they are real, in-use names; only the product name has been corrected.
 
-**Prepared:** 2026-07-01 · **Verification pass:** 2026-07-02 (advisors re-run, usage counts re-queried, deployment history refreshed — deltas noted inline)
+**Prepared:** 2026-07-01 · **Verification passes:** 2026-07-02 (advisors re-run, usage counts re-queried, deployment history refreshed) · **2026-07-12** (security & performance advisors re-run against live — significant security movement, deltas noted inline in §4–§5 and §8)
 **Scope:** Live production system behind `www.rinkreports.com` — Next.js app (Vercel project `rink-reports-5-6`) + Supabase Postgres backend (project `bqbdgwlhbhabsibjgwmk`, Postgres 17.6).
 **Method:** Direct inspection of the live database schema/data (140 tables), Supabase security & performance advisors, and Vercel deployment history (~25 most recent merged PRs). The application source code itself lives in a separate GitHub repo (`KellyJ386/Rink-Reports-5-6`) that this audit session did not have read access to — findings about code-level behavior below are inferred from commit messages, schema comments, and live data, not from reading the source directly. Anything in that category is flagged as such.
 
@@ -59,34 +59,34 @@ Reconstructed from Vercel deployment metadata (commit messages), most recent fir
 
 ---
 
-## 4. Security Findings (from live Supabase advisors; re-verified unchanged 2026-07-02)
+## 4. Security Findings (from live Supabase advisors)
 
-**63 advisor entries total: 62 WARN, 1 INFO, 0 ERROR.**
+**As of the 2026-07-12 re-run: 46 advisor entries total — 45 WARN, 1 INFO, 0 ERROR** (down from 63 at the 2026-07-02 pass). The drop reflects real hardening: 6 of the 7 anon-executable functions were revoked, the mutable `search_path` on `schedule_swap_set_expiry` was fixed, and the intentional-pattern SECURITY DEFINER count fell 52 → 42. Two of the four "needs action" items below remain open; status is marked inline.
 
 ### Needs action
 
-1. **`information_requests` — unconditionally permissive INSERT policy, open to `anon`.**
+1. **`information_requests` — unconditionally permissive INSERT policy, open to `anon`.** ⚠️ **STILL OPEN (2026-07-12).**
    Policy `information_requests_insert` has `WITH CHECK (true)` for roles `anon, authenticated` — anyone on the internet can insert rows with no validation. Table currently has 0 rows, so no data has been affected, but this is either (a) an intentional public "request more info" form, in which case it should be paired with rate-limiting and a narrower column set, or (b) an oversight. **Needs a decision, not just a fix** — confirm intent before changing.
 
-2. **7 functions still callable by unauthenticated `anon` role via `/rest/v1/rpc/<name>`:** `check_rate_limit`, `enforce_incident_witnesses_cap`, `seed_default_facility_air_quality_config`, `seed_default_facility_modules`, `tg_seed_facility_air_quality_config`, `tg_seed_facility_modules`, `trg_seed_facility_dropdown_options`. PR #239 already revoked EXECUTE on a subset of internal seed/trigger functions — these 5 seed/trigger functions plus `check_rate_limit`/`enforce_incident_witnesses_cap` weren't covered by that pass and take a `facility_id`/similar argument with no internal authorization check, so a direct RPC call could act on a facility a caller has no relationship to. Same fix pattern as PR #239: revoke `EXECUTE` from `anon`/`authenticated`/`public`, keep it callable from triggers and `SECURITY DEFINER` context.
+2. **Anon-executable RPC functions — ✅ mostly resolved (2026-07-12): 6 of 7 revoked, 1 remains.** The audit flagged 7 functions callable by unauthenticated `anon` via `/rest/v1/rpc/<name>`. As of 2026-07-12 only **`check_rate_limit(p_bucket, p_identifier, p_max, p_window_seconds)`** is still anon-executable; the other six (`enforce_incident_witnesses_cap`, `seed_default_facility_air_quality_config`, `seed_default_facility_modules`, `tg_seed_facility_air_quality_config`, `tg_seed_facility_modules`, `trg_seed_facility_dropdown_options`) have had EXECUTE revoked. `check_rate_limit` is the rate limiter itself but takes caller-supplied args with no internal authorization gate, so the same fix pattern still applies: revoke `EXECUTE` from `anon`/`authenticated`/`public`, keep it callable from `SECURITY DEFINER` context.
 
-3. **`function_search_path_mutable` — `schedule_swap_set_expiry`** has no fixed `search_path`, meaning it resolves unqualified object names using the caller's `search_path` rather than a pinned one — a schema-hijacking vector if a caller can control search_path. Standard fix: `SET search_path = ''` (or `pg_catalog, public`) on the function.
+3. **`function_search_path_mutable` — `schedule_swap_set_expiry`** ✅ **FIXED (2026-07-12):** no longer flagged by the advisor; the function now has a pinned `search_path`. *(Original finding: it resolved unqualified object names using the caller's `search_path`, a schema-hijacking vector.)*
 
-4. **Leaked-password protection is disabled** in Supabase Auth (HaveIBeenPwned check). One-click enable in Auth settings; no code change needed. *(Re-verified still disabled 2026-07-02 — PR #243 touched HIBP-related docs but the Auth setting itself remains off.)*
+4. **Leaked-password protection is disabled** in Supabase Auth (HaveIBeenPwned check). ⚠️ **STILL DISABLED (2026-07-12).** One-click enable in Auth settings; no code change needed. *(PR #243 touched HIBP-related docs but the Auth setting itself remains off.)*
 
 ### Not action items (verified as intentional)
 
-- **52 more functions flagged as "authenticated can execute SECURITY DEFINER"** (`current_user_id`, `has_module_access`, `is_facility_admin`, `scheduling_claim_open_shift`, `audit_row_change`, etc.) — this is the standard Supabase pattern for permission-check/RPC helper functions that need `SECURITY DEFINER` to read across RLS boundaries safely. These are almost certainly intentional; a full one-by-one audit would need source access to confirm each function internally re-validates `auth.uid()`/facility scope, which the app's schema comments suggest is the established convention (e.g. `current_employee_id()`, `is_super_admin()`).
+- **Functions flagged as "authenticated can execute SECURITY DEFINER"** (`current_user_id`, `has_module_access`, `is_facility_admin`, `scheduling_claim_open_shift`, etc.) — **42 as of 2026-07-12, down from 52** at the audit. This is the standard Supabase pattern for permission-check/RPC helper functions that need `SECURITY DEFINER` to read across RLS boundaries safely. These are almost certainly intentional; a full one-by-one audit would need source access to confirm each function internally re-validates `auth.uid()`/facility scope, which the app's schema comments suggest is the established convention (e.g. `current_employee_id()`, `is_super_admin()`).
 - **`rate_limit_counters` — RLS enabled, no policies.** Flagged INFO, but the table's own comment states this is deliberate: "Reachable ONLY through `public.check_rate_limit()`; RLS is enabled with no policies so direct anon/authenticated access is denied." Correct pattern, no action needed.
 
 ---
 
 ## 5. Performance Findings (from live Supabase advisors)
 
-**162 advisor entries, all INFO level** (no errors/warnings — this is all "could be tighter," not "something's broken"):
+**161 advisor entries as of 2026-07-12, all INFO level** (162 at the audit — essentially unchanged; no errors/warnings, all "could be tighter," not "something's broken"):
 
-- **105 unused indexes** across 58 tables — expected at this data volume (most tables have single-digit-to-low-hundreds row counts); not a real cost yet, but worth revisiting once production traffic and real query patterns exist. Don't drop these pre-emptively — they were sized for expected access patterns, not current pilot data.
-- **56 foreign keys without a covering index** — the standard next-tier finding after unused indexes; matters more once join volume grows (e.g., `audit_logs.actor_employee_id`, `schedule_shifts.template_origin_id`, various `*_followup_notes.employee_id`). Low urgency at current scale, worth batching into one migration before general availability.
+- **103 unused indexes** (105 at audit) across ~58 tables — expected at this data volume (most tables have single-digit-to-low-hundreds row counts); not a real cost yet, but worth revisiting once production traffic and real query patterns exist. Don't drop these pre-emptively — they were sized for expected access patterns, not current pilot data.
+- **57 foreign keys without a covering index** (56 at audit) — the standard next-tier finding after unused indexes; matters more once join volume grows (e.g., `audit_logs.actor_employee_id`, `schedule_shifts.template_origin_id`, various `*_followup_notes.employee_id`). Low urgency at current scale, worth batching into one migration before general availability.
 - **1 `auth_db_connections_absolute` finding** — Auth server connection pool is configured as an absolute count (10) rather than a percentage of the pool, so vertically scaling the Postgres instance won't automatically scale Auth throughput. Cheap fix in Supabase project settings before any real load-testing.
 
 ---
@@ -108,15 +108,15 @@ Two Vercel projects both currently list `rinkreports.com` / `www.rinkreports.com
 
 ## 8. Recommended Roadmap
 
-**Now (this week, low-effort/high-value security cleanup):**
-1. Decide intent on `information_requests` anon-insert policy; narrow or rate-limit it either way.
-2. Revoke `anon`/`authenticated` EXECUTE on the 7 remaining exposed functions (§4.2) — same pattern as PR #239.
-3. Pin `search_path` on `schedule_swap_set_expiry`.
-4. Enable leaked-password protection in Auth settings.
-5. Confirm the `mfo-rink-reports-2-7` domain binding is inert.
+**Now (this week, low-effort/high-value security cleanup):** — *2026-07-12 status inline*
+1. ⚠️ **STILL OPEN** — Decide intent on `information_requests` anon-insert policy; narrow or rate-limit it either way.
+2. ✅ **6 of 7 done** — Anon EXECUTE revoked on six functions; only `check_rate_limit` remains (§4.2). Revoke it too, same pattern as PR #239.
+3. ✅ **DONE** — `search_path` now pinned on `schedule_swap_set_expiry` (no longer advisor-flagged).
+4. ⚠️ **STILL OPEN** — Enable leaked-password protection in Auth settings.
+5. Confirm the `mfo-rink-reports-2-7` domain binding is inert. *(Vercel-side; not covered by the 2026-07-12 DB advisor re-run.)*
 
 **Next (before onboarding a second facility / real GA):**
-6. Land the FK-covering-index migration (56 columns) — cheap insurance before multi-tenant write volume grows.
+6. Land the FK-covering-index migration (~57 columns as of 2026-07-12) — cheap insurance before multi-tenant write volume grows.
 7. Fix Auth DB connection strategy to percentage-based.
 8. Drop `role_module_permission_defaults` once confirmed unused by the admin UI.
 9. Get real usage into the untested modules (Communications, Air Quality, Accident Reports) — either through the pilot facility's actual workflows or a deliberate UAT pass — before trusting their RLS/business logic under real load. A module with 0 production rows has had zero real-world validation of its write paths.
