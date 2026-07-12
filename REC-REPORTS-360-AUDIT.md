@@ -1,4 +1,6 @@
-# Rink Reports — 360° Audit & Roadmap
+# Rec Reports — 360° Audit & Roadmap
+
+> **Product name:** the product is **Rec Reports**. Its live infrastructure still carries the legacy "Rink Reports" branding — the `rinkreports.com` domain, the Vercel project `rink-reports-5-6`, the Supabase project "Rink Reports 5-6", and the GitHub repo `Rink-Reports-5-6`. Those literal identifiers are left unchanged below because they are real, in-use names; only the product name has been corrected.
 
 **Prepared:** 2026-07-01 · **Verification pass:** 2026-07-02 (advisors re-run, usage counts re-queried, deployment history refreshed — deltas noted inline)
 **Scope:** Live production system behind `www.rinkreports.com` — Next.js app (Vercel project `rink-reports-5-6`) + Supabase Postgres backend (project `bqbdgwlhbhabsibjgwmk`, Postgres 17.6).
@@ -8,7 +10,7 @@
 
 ## 1. Executive Summary
 
-Rink Reports is a multi-tenant, facility-operations platform for ice rinks (daily checklists, incident/accident reporting, refrigeration & air-quality monitoring, ice-depth tracking, employee scheduling, internal communications, role-based permissions). The schema is unusually mature for a pre-launch product: 140 tables, 165 migrations worth of iteration, deliberate immutability/audit-trail patterns (snapshot columns, append-only change logs, 24-hour edit windows), and a genuine multi-tenant permission model (roles → module permissions → per-area permissions).
+Rec Reports is a multi-tenant, facility-operations platform for ice rinks (daily checklists, incident/accident reporting, refrigeration & air-quality monitoring, ice-depth tracking, employee scheduling, internal communications, role-based permissions). The schema is unusually mature for a pre-launch product: 140 tables, 165 migrations worth of iteration, deliberate immutability/audit-trail patterns (snapshot columns, append-only change logs, 24-hour edit windows), and a genuine multi-tenant permission model (roles → module permissions → per-area permissions).
 
 Engineering velocity is high — the last ~25 merged PRs alone cover a full scheduling-grid rebuild (drag/drop, keyboard accessibility, publish-lock governance), a new Playwright E2E suite, an 8-chapter training/onboarding manual, and two rounds of RLS/RPC security hardening.
 
